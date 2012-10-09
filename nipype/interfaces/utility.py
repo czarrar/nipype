@@ -1,14 +1,17 @@
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
 # vi: set ft=python sts=4 ts=4 sw=4 et:
+import inspect
 import os
 import re
 import numpy as np
 import nibabel as nb
+from string import Template
 
 from nipype.utils.filemanip import (filename_to_list, copyfile, split_filename)
 from nipype.interfaces.base import (traits, TraitedSpec, DynamicTraitedSpec, File,
                                     Undefined, isdefined, OutputMultiPath,
-    InputMultiPath, BaseInterface, BaseInterfaceInputSpec)
+                                    InputMultiPath, BaseInterface, TraitError, 
+                                    BaseInterfaceInputSpec, CommandLine)
 from nipype.interfaces.io import IOBase, add_traits
 from nipype.testing import assert_equal
 from nipype.utils.misc import getsource, create_function_from_source, dumps
@@ -411,6 +414,328 @@ class Function(IOBase):
         for key in self._output_names:
             outputs[key] = self._out[key]
         return outputs
+
+
+class CommandError(Exception):
+    def __init__(self, message, caller_info):
+        super(CommandError, self).__init__(message)
+        self.caller_info = caller_info
+    
+    def __str__(self):
+        msg = self.message
+        msg += ".  Error originated from command '%(code)s' found in file '%(filename)s' on line #%(line)s." % self.caller_info
+        return msg
+
+class CommandInputSpec(DynamicTraitedSpec, BaseInterfaceInputSpec):
+    environ      = traits.DictStrStr(desc='Environment variables', usedefault=True)
+    _caller_info = traits.Dict(desc='Information related to the function calling an instance of the Command class')
+    
+    def __setattr__(self, key, value):
+        try:
+            super(CommandInputSpec, self).__setattr__(key, value)
+        except TraitError as e:
+            if isdefined(self._caller_info):
+                raise CommandError("TraitError: %s" % e.args[0], self._caller_info)
+            else:
+                raise
+
+class CommandOutputSpec(DynamicTraitedSpec):
+    stdout      = traits.String(desc="Command-line output")
+    stderr      = traits.String(desc="Command-line error output")
+    returncode  = traits.Int(desc="Return code from executing command")
+
+class Command(CommandLine, IOBase):
+    """A generic command-line interface.
+    
+    Inputs and outputs can be dynamically created, either via the constructor 
+    using the in_files, out_files, or opt_names keywords or via the functions
+    add_input(s) and add_output(s). The command can include placeholders 
+    ($-based) that will be substituted at runtime with values from inputs. 
+    Substitution is done with python's string.Template class.
+    
+    Examples
+    --------
+    
+    >>> from nipype.interfaces.utility import Command
+    >>> from nipype.testing import example_data
+    >>> 
+    >>> cmd = Command('ls $args $infile', in_files='infile', opt_names='args')
+    >>> cmd.inputs.args = '-al'
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.cmdline
+    >>> res = cmd.run()         # doctest: +SKIP
+    >>> # Have access to return code, stdout, and stderr
+    >>> # for connecting with other nodes.
+    >>> res.outputs.returncode  # doctest: +SKIP
+    >>> res.outputs.stdout      # doctest: +SKIP
+    >>> res.outputs.stderr      # doctest: +SKIP
+    >>>
+    >>> # Same as above except inputs are added later
+    >>> cmd = Command('ls $args $infile')
+    >>> cmd.add_input('args', type='String', mandatory=True)
+    >>> cmd.add_input('infile', type='File', exists=True, mandatory=True)
+    >>> cmd.inputs.args = '-al'
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.cmdline
+    >>> res = cmd.run() # doctest: +SKIP
+    >>> 
+    >>> # Showing command with an output.
+    >>> cmd = Command('fslmaths $infile -bin $outfile', in_files='infile', out_files='outfile')
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.inputs.outfile = 'structural_bin.nii.gz'
+    >>> cmd.cmdline
+    >>> 
+    >>> # Same as above except the input and output are set later
+    >>> cmd = Command('fslmaths $infile -bin $outfile')
+    >>> cmd.add_input('infile', type='File', exists=True, mandatory=True)
+    >>> cmd.add_output('outfile', type='File', exists=True)
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.inputs.outfile = 'structural_bin.nii.gz'
+    >>> cmd.cmdline
+    >>> 
+    >>> # Similar to above except making use of auto-generated output
+    >>> # note that extension in out_files will be stripped and added later.
+    >>> cmd = Command('fslmaths $infile -bin $structural_bin', in_files='infile', out_files='structural_bin.nii.gz') 
+    >>> cmd.inputs.structural_bin # this will be auto-generated at run-time
+    <undefined>
+    
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.cmdline # here can see the auto-generated output filename
+    >>> 
+    >>> # Most error handling is wrapped in CommandError that gives the user 
+    >>> # information about what first called the Command class.
+    >>> cmd = Command('fslmaths $infile -thr $thr -bin $outfile', in_files='infile', out_files='out_file')
+    >>>
+    >>> # will get an error because infile doesn't exist
+    >>> cmd.inputs.infile = 'something_that_hopefully_doesnt_exist.txt' # doctest: +SKIP
+    >>>
+    >>> # will get an error because infile isn't specified and is mandatory
+    >>> cmd.cmdline # doctest: +SKIP
+    >>>
+    >>> # will get an error because $thr is a placeholder in the command but
+    >>> # isn't specified in the inputs
+    >>> cmd.inputs.infile = example_data('structural.nii')
+    >>> cmd.cmdline # doctest: +SKIP 
+    """
+    
+    input_spec  = CommandInputSpec
+    output_spec = CommandOutputSpec
+    
+    def __init__(self, command, in_files=[], out_files=[], opt_names=[], 
+                    **kwrds):
+        """
+        Parameters
+        ----------
+        
+        command : str
+            Command with arguments to be executed. Can include placeholders 
+            (e.g. 'ls $args') to be substituted with input values, including 
+            those from in_files, out_files, and opt_names.
+        in_files : single str or list
+            Names corresponding to mandatory input files. When specified, 
+            these inputs must be files that exist.
+        out_files : single str or list
+            Names corresponding to output files. These files must exist after 
+            the command has executed. An input will also be created with the 
+            same name and will be auto-generated if not explicitly specified.
+            An extension can be provided in the name, which will be stripped 
+            and used when auto-generating the output filename.
+        opt_names : single str or list
+            Names of any mandatory options or arguments intended to be used in 
+            the command. If you want to have an optional option, then you need
+            to create the input via the add_input() function.
+        kwrds : keyword arguments
+            Keyword arguments to be passed to the parent CommandLine and IOBase
+            classes.
+        """
+        lst = command.split()
+        self._cmd, self._args = lst[0], lst[1:]
+        super(Command, self).__init__(**kwrds)
+        in_files = filename_to_list(in_files)
+        out_files = filename_to_list(out_files)
+        opt_names = filename_to_list(opt_names)
+        self.add_inputs(in_files, type='File', exists=True, mandatory=True)
+        self.add_inputs(opt_names, type='String', mandatory=True)
+        self._out = {}
+        self._out_type = {}
+        self._out_opts = {}
+        self.add_outputs(out_files, type='File', exists=True)
+        self._stdout = None
+        self._stderr = None
+        self._returncode = None
+        # save information about calling function for debugging
+        tmp = inspect.stack()[1]
+        self.inputs._caller_info = {'filename': str(tmp[1]), 'line': tmp[2], 
+                                    'function': tmp[3], 'code': tmp[4][0].strip()}
+        del tmp
+        
+    def add_input(self, name, type='String', **trait_opts):
+        """Dynamically adds a new input to the input spec.
+        
+        Parameters
+        ----------
+        name : str
+            Name of input to add.
+        type : str
+            The type of trait (default is 'String')
+        trait_opts : keyword arguments
+            Keyword arguments to pass to the Trait constructor.
+        """
+        self._check_trait(type)
+        t = getattr(traits, type)
+        default = trait_opts.setdefault('value', Undefined)
+        self.inputs.add_trait(name, t(**trait_opts))
+        setattr(self.inputs, name, default)
+        # Or do i need to do this?
+        # self.inputs.trait_set(trait_change_notify=False, **{'%s' % name: default})
+    
+    def add_inputs(self, names, **input_opts):
+        """Add several inputs with the same trait properties at once."""
+        for name in names:
+            self.add_input(name, **input_opts)
+    
+    def add_output(self, name, type='String', add_input=True, **trait_opts):
+        """Sets up a new output, which will actually be added later at runtime.
+        
+        When add_input is True, then an input will also be created with the 
+        same name and type as well as having genfile=True.
+        
+        Parameters
+        ----------
+        name : str
+            Name of input to add.
+        type : str
+            The type of trait (default is 'String')
+        add_input : bool
+            Should a corresponding input be added as well (default is True)
+        trait_opts : keyword arguments
+            Keyword arguments to pass to the Trait constructor.
+        """
+        self._check_trait(type)
+        pth,name,ext = split_filename(name)
+        if add_input:
+            self.add_input(name, type, genfile=True)
+        self._out[name] = {'basename': name, 'cwd': pth, 'ext': ext}
+        self._out_type[name] = type
+        self._out_opts[name] = trait_opts
+    
+    def add_outputs(self, names, **output_opts):
+        """Add several outputs with the same trait properties at once."""
+        for name in names:
+            self.add_output(name, **output_opts)
+    
+    @property
+    def cmdline(self):
+        try:
+            self._check_mandatory_inputs()
+        except ValueError as e:
+            raise CommandError("ValueError: %s" % e.message, self.inputs._caller_info)
+        allargs = self._args[:] # do we want deepcopy here?
+        allargs.insert(0, self.cmd)
+        cmd_to_execute = ' '.join(allargs)
+        try:
+            cmd_to_execute = Template(cmd_to_execute).substitute(self.context)
+        except KeyError as e:
+            raise CommandError("KeyError: missing value for input '%s' with command '%s'" % (', '.join(e), self.cmd), self.inputs._caller_info)
+        return cmd_to_execute
+    
+    @property
+    def context(self):
+        """A dictionary from self.inputs with any auto-generated filenames.
+        
+        Intended to be used in substituting placeholders found in the command 
+        to execute."""
+        context = {}
+        for name,spec in self.inputs.items():
+            value = getattr(self.inputs, name)
+            if isdefined(value):
+                context[name] = value
+            elif spec.genfile:
+                context[name] = self._gen_filename(name)
+        return context
+    
+    def _run_interface(self, runtime):
+        runtime = CommandLine._run_interface(self, runtime) # can't use super since will also call IOBase and screw things up
+        self._stdout     = runtime.stdout
+        self._stderr     = runtime.stderr
+        self._returncode = runtime.returncode
+        return runtime
+    
+    def _check_trait(self, name):
+        """Checks that a given type of trait exists."""
+        if not hasattr(traits, name):
+            msg  = "%s not a valid trait type. " % type
+            msg += "Error for command: %s" % self.cmdline
+            raise Exception(msg)
+    
+    def _format_arg(self, name, trait_spec, value):
+        raise NotImplementedError
+        
+    def _parse_inputs(self):
+        raise NotImplementedError
+    
+    def _list_outputs(self):
+        outputs = self._outputs().get()
+        for name in self._out.keys():
+            if isdefined(getattr(self.inputs, name)):
+                outputs[name] = os.path.realpath(getattr(self.inputs, name))
+            else:
+                outputs[name] = self._gen_filename(name)
+        outputs['stdout']     = self._stdout
+        outputs['stderr']     = self._stderr
+        outputs['returncode'] = self._returncode
+        return outputs
+    
+    def _add_output_traits(self, base):
+        trait_values = {}
+        for key in self._out.keys():
+            t = getattr(traits, self._out_type[key])
+            base.add_trait(key, t(**self._out_opts[key]))
+            trait_values[key] = Undefined
+        base.trait_set(trait_change_notify=False, **trait_values)
+        return base
+    
+    def _gen_filename(self, name):
+        """ Generate filename attributes before running.
+
+        Called when trait.genfile = True and trait is Undefined
+        """
+        return self._gen_fname(**self._out[name])
+    
+    def _gen_fname(self, basename, cwd='', suffix='', ext=''):
+        """Generate a filename based on the given parameters.
+
+        The filename will take the form: cwd/basename<suffix><ext>.
+        If change_ext is True, it will use the extensions specified in
+        <instance>inputs.outputtype.
+
+        Parameters
+        ----------
+        basename : str
+            Filename to base the new filename on.
+        cwd : str
+            Path to prefix to the new filename. (default is os.getcwd())
+        suffix : str
+            Suffix to add to the `basename`.  (default is '')
+        ext : str
+            Extension for the filename (default is '')
+
+        Returns
+        -------
+        fname : str
+            New filename based on given parameters.
+
+        """
+
+        if basename is '':
+            msg = 'Unable to generate filename for command %s. ' % self.cmd
+            msg += 'basename is not set!'
+            raise ValueError(msg)
+        if cwd is '':
+            cwd = os.getcwd()
+        pth = os.path.abspath(cwd)
+        fname = os.path.join(pth, basename+suffix+ext)
+        return fname
 
 
 class AssertEqualInputSpec(BaseInterfaceInputSpec):
